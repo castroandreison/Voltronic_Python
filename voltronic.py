@@ -5,28 +5,60 @@ import serial.tools.list_ports
 import threading
 import time
 
-# =====================================================
+# =========================================================
+# CRC16 XMODEM
+# =========================================================
+
+def crc16_xmodem(data: bytes):
+
+    crc = 0x0000
+
+    for byte in data:
+
+        crc ^= (byte << 8)
+
+        for _ in range(8):
+
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+
+            crc &= 0xFFFF
+
+    return crc
+
+
+def build_packet(cmd: str):
+
+    data = cmd.encode()
+
+    crc = crc16_xmodem(data)
+
+    crc_bytes = crc.to_bytes(2, "big")
+
+    packet = data + crc_bytes + b'\r'
+
+    return packet
+
+
+# =========================================================
 # SERIAL DRIVER
-# =====================================================
+# =========================================================
+
 class SerialDriver:
+
     def __init__(self):
+
         self.ser = None
         self.port = None
 
-    def autodetect(self):
-        ports = list(serial.tools.list_ports.comports())
-        for p in ports:
-            if "USB" in p.description or "COM" in p.device:
-                return p.device
-        return None
+    def connect(self, port):
 
-    def connect(self):
-        self.port = self.autodetect()
-        if not self.port:
-            raise Exception("Nenhuma porta serial encontrada")
+        self.port = port
 
         self.ser = serial.Serial(
-            port=self.port,
+            port=port,
             baudrate=2400,
             bytesize=8,
             parity='N',
@@ -34,194 +66,275 @@ class SerialDriver:
             timeout=1
         )
 
+    def disconnect(self):
+
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+
     def send(self, cmd):
+
+        if not self.ser or not self.ser.is_open:
+            return None
+
+        packet = build_packet(cmd)
+
         try:
-            self.ser.write(cmd.encode())
-            return self.ser.readline().decode(errors="ignore").strip()
-        except:
+
+            self.ser.reset_input_buffer()
+
+            self.ser.write(packet)
+
+            response = self.ser.readline()
+
+            return response
+
+        except Exception as e:
+
+            print("Serial error:", e)
+
             return None
 
 
-# =====================================================
+# =========================================================
 # AXPERT PROTOCOL
-# =====================================================
-class Axpert:
-    def __init__(self, drv):
-        self.drv = drv
+# =========================================================
 
-    def qpigs(self): return self.drv.send("QPIGS\r")
-    def qmod(self):  return self.drv.send("QMOD\r")
+class AxpertProtocol:
+
+    def __init__(self, driver):
+
+        self.driver = driver
+
+    def qpigs(self):
+        return self.driver.send("QPIGS")
+
+    def qmod(self):
+        return self.driver.send("QMOD")
+
+    def qpiri(self):
+        return self.driver.send("QPIRI")
 
 
-# =====================================================
-# UI
-# =====================================================
+# =========================================================
+# MAIN APPLICATION
+# =========================================================
+
 class AxpertApp(tk.Tk):
+
     def __init__(self):
+
         super().__init__()
 
         self.title("AXPERT MONITOR PRO")
-        self.geometry("1280x760")
-        self.configure(bg="#1e1e1e")
-        self.resizable(False, False)
-
-        self.style = ttk.Style(self)
-        self.style.theme_use("default")
-        self._dark_theme()
+        self.geometry("1100x700")
 
         self.driver = SerialDriver()
-        self.axpert = Axpert(self.driver)
+        self.axpert = AxpertProtocol(self.driver)
 
-        self._build_ui()
+        self.running = False
 
-    def _dark_theme(self):
-        self.style.configure(".", background="#1e1e1e", foreground="white")
-        self.style.configure("Treeview",
-            background="#252526",
-            fieldbackground="#252526",
-            foreground="white",
-            rowheight=26)
-        self.style.map("Treeview", background=[("selected", "#007acc")])
+        self.create_ui()
 
-    def _build_ui(self):
-        self._header()
-        self._notebook()
-        self._log()
+    # =====================================================
+    # UI
+    # =====================================================
 
-    def _header(self):
-        frame = ttk.Frame(self, padding=10)
-        frame.pack(fill="x")
+    def create_ui(self):
 
-        ttk.Label(frame,
-            text="AXPERT INVERTER MONITOR",
-            font=("Segoe UI", 18, "bold")
-        ).pack(side="left")
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=10, pady=10)
 
-        self.lbl_status = ttk.Label(frame,
-            text="● DESCONECTADO",
-            foreground="red"
-        )
-        self.lbl_status.pack(side="right")
+        ttk.Label(top, text="Porta COM").pack(side="left")
 
-    def _notebook(self):
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=5)
+        self.combo_ports = ttk.Combobox(top, width=10, state="readonly")
+        self.combo_ports.pack(side="left", padx=5)
 
-        self.tabs = {}
-        for name in ["Status Geral", "Bateria", "Solar / PV", "Sistema"]:
-            self.tabs[name] = self._create_tab(name)
+        ttk.Button(top, text="Atualizar", command=self.update_ports).pack(side="left")
+        ttk.Button(top, text="Conectar", command=self.connect).pack(side="left", padx=5)
+        ttk.Button(top, text="Desconectar", command=self.disconnect).pack(side="left")
 
-    def _create_tab(self, title):
-        tab = ttk.Frame(self.nb)
-        self.nb.add(tab, text=title)
+        self.status = ttk.Label(top, text="DESCONECTADO", foreground="red")
+        self.status.pack(side="right")
 
-        tree = ttk.Treeview(tab, columns=("desc", "value"), show="headings")
-        tree.heading("desc", text="Descrição")
-        tree.heading("value", text="Valor")
-        tree.column("desc", width=520)
-        tree.column("value", width=240, anchor="center")
-        tree.pack(fill="both", expand=True, padx=10, pady=10)
+        self.update_ports()
 
-        tab.tree = tree
-        return tab
+        self.tabs = ttk.Notebook(self)
+        self.tabs.pack(fill="both", expand=True)
 
-    def _log(self):
-        frame = ttk.LabelFrame(self, text="Log RS232")
-        frame.pack(fill="x", padx=10, pady=5)
+        self.tab_status = self.create_table("Status Geral")
+        self.tab_battery = self.create_table("Bateria")
+        self.tab_pv = self.create_table("Solar PV")
 
-        self.log = tk.Text(frame, height=6, bg="#111", fg="#00ff99")
+        log_frame = ttk.LabelFrame(self, text="Log Serial")
+        log_frame.pack(fill="x", padx=10, pady=10)
+
+        self.log = tk.Text(log_frame, height=8)
         self.log.pack(fill="x")
 
-    def log_msg(self, msg):
-        self.log.insert("end", msg + "\n")
-        self.log.see("end")
+    def create_table(self, name):
+
+        frame = ttk.Frame(self.tabs)
+
+        self.tabs.add(frame, text=name)
+
+        tree = ttk.Treeview(frame, columns=("desc", "value"), show="headings")
+
+        tree.heading("desc", text="Descrição")
+        tree.heading("value", text="Valor")
+
+        tree.column("desc", width=400)
+        tree.column("value", width=200)
+
+        tree.pack(fill="both", expand=True)
+
+        frame.tree = tree
+
+        return frame
 
     # =====================================================
-    # START / LOOP
+    # SERIAL
     # =====================================================
-    def start(self):
-        while True:
-            try:
-                self.driver.connect()
-                self.lbl_status.config(
-                    text=f"● CONECTADO ({self.driver.port})",
-                    foreground="#00ff99"
-                )
-                threading.Thread(target=self.loop, daemon=True).start()
-                return
-            except:
-                self.lbl_status.config(text="● AGUARDANDO PORTA", foreground="orange")
-                time.sleep(2)
+
+    def update_ports(self):
+
+        ports = serial.tools.list_ports.comports()
+
+        names = [p.device for p in ports]
+
+        self.combo_ports["values"] = names
+
+        if names:
+            self.combo_ports.current(0)
+
+    def connect(self):
+
+        port = self.combo_ports.get()
+
+        try:
+
+            self.driver.connect(port)
+
+            self.running = True
+
+            self.status.config(text="CONECTADO", foreground="green")
+
+            threading.Thread(target=self.loop, daemon=True).start()
+
+            self.log_msg(f"Conectado em {port}")
+
+        except Exception as e:
+
+            self.log_msg(str(e))
+
+    def disconnect(self):
+
+        self.running = False
+
+        self.driver.disconnect()
+
+        self.status.config(text="DESCONECTADO", foreground="red")
+
+        self.log_msg("Desconectado")
+
+    # =====================================================
+    # LOOP
+    # =====================================================
 
     def loop(self):
-        while True:
+
+        while self.running:
+
             self.read_qpigs()
+
             self.read_qmod()
-            time.sleep(1)
+
+            time.sleep(2)
 
     # =====================================================
-    # QPIGS COMPLETO
+    # COMMAND READERS
     # =====================================================
+
     def read_qpigs(self):
+
         resp = self.axpert.qpigs()
+
         if not resp:
             return
 
-        self.log_msg(f"QPIGS → {resp}")
-        d = resp.strip("()").split()
+        try:
 
-        status = [
-            ("Tensão Rede", f"{d[0]} V"),
-            ("Frequência Rede", f"{d[1]} Hz"),
-            ("Tensão Saída", f"{d[2]} V"),
-            ("Frequência Saída", f"{d[3]} Hz"),
-            ("Potência Aparente", f"{d[4]} VA"),
-            ("Potência Ativa", f"{d[5]} W"),
-            ("Carga", f"{d[6]} %"),
-            ("Barramento DC", f"{d[7]} V"),
-            ("Temperatura Dissipador", f"{d[11]} °C"),
-        ]
+            text = resp.decode(errors="ignore").strip()
 
-        battery = [
-            ("Tensão Bateria", f"{d[8]} V"),
-            ("Corrente Carga", f"{d[9]} A"),
-            ("SOC", f"{d[10]} %"),
-            ("Corrente Descarga", f"{d[16]} A"),
-            ("Tensão SCC", f"{d[15]} V"),
-        ]
+            self.log_msg("QPIGS -> " + text)
 
-        pv = [
-            ("Corrente PV", f"{d[12]} A"),
-            ("Tensão PV", f"{d[13]} V"),
-            ("Potência PV", f"{d[18]} W"),
-        ]
+            data = text.strip("()").split()
 
-        system = [
-            ("EEPROM Version", d[17]),
-            ("Status Flags", d[14]),
-        ]
+            if len(data) < 19:
+                return
 
-        self._update("Status Geral", status)
-        self._update("Bateria", battery)
-        self._update("Solar / PV", pv)
-        self._update("Sistema", system)
+            status = [
+                ("Tensão Rede", data[0] + " V"),
+                ("Frequência Rede", data[1] + " Hz"),
+                ("Tensão Saída", data[2] + " V"),
+                ("Frequência Saída", data[3] + " Hz"),
+                ("Carga", data[6] + " %"),
+                ("Barramento DC", data[7] + " V"),
+                ("Temperatura", data[11] + " °C")
+            ]
+
+            battery = [
+                ("Tensão Bateria", data[8] + " V"),
+                ("Corrente Carga", data[9] + " A"),
+                ("SOC", data[10] + " %")
+            ]
+
+            pv = [
+                ("Corrente PV", data[12] + " A"),
+                ("Tensão PV", data[13] + " V"),
+                ("Potência PV", data[18] + " W")
+            ]
+
+            self.update_table(self.tab_status.tree, status)
+            self.update_table(self.tab_battery.tree, battery)
+            self.update_table(self.tab_pv.tree, pv)
+
+        except:
+            pass
 
     def read_qmod(self):
-        resp = self.axpert.qmod()
-        if resp:
-            self.log_msg(f"QMOD → {resp}")
 
-    def _update(self, tab, rows):
-        tree = self.tabs[tab].tree
+        resp = self.axpert.qmod()
+
+        if resp:
+
+            text = resp.decode(errors="ignore").strip()
+
+            self.log_msg("QMOD -> " + text)
+
+    # =====================================================
+    # UI HELPERS
+    # =====================================================
+
+    def update_table(self, tree, rows):
+
         tree.delete(*tree.get_children())
+
         for r in rows:
             tree.insert("", "end", values=r)
 
+    def log_msg(self, msg):
 
-# =====================================================
+        self.log.insert("end", msg + "\n")
+
+        self.log.see("end")
+
+
+# =========================================================
 # RUN
-# =====================================================
+# =========================================================
+
 if __name__ == "__main__":
+
     app = AxpertApp()
-    app.after(500, app.start)
+
     app.mainloop()
